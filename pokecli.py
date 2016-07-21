@@ -14,6 +14,9 @@ from google.protobuf.internal import encoder
 from geopy.geocoders import GoogleV3
 from s2sphere import CellId, LatLng
 
+import threading
+
+
 log = logging.getLogger(__name__)
 
 pokestops_filename = "pokestops.json"
@@ -130,13 +133,53 @@ def init_config():
     return config
 
 def distance_by_points(lat1, lng1, lat2, lng2):
-    coord1 = s2sphere.LatLng.from_degrees(lat1, lng1)
-    coord2 = s2sphere.LatLng.from_degrees(lat2, lng2)
+    coord1 = LatLng.from_degrees(lat1, lng1)
+    coord2 = LatLng.from_degrees(lat2, lng2)
     angle = coord1.get_distance(coord2)
-    return 6371e3 * angle.radians
+    return angle.radians
 
+
+def pokefarm_thread(api):
+    global position
+    if (len(pokestops_farms)) < 1:
+        print "No pokestops! Load or search for them."
+        return
+    print "Starting to farm pokestops"
+    old_position = position
+    for pokeid, pokestop in pokestops_farms.iteritems():
+        lat = pokestop['latitude']
+        lng = pokestop['longitude']
+        api.set_position(*(lat, lng, 0.0))
+        api.fort_search(fort_id=pokeid, fort_latitude=lat, fort_longitude=lng, player_latitude=f2i(lat), player_longitude=f2i(lng))
+        response = api.call()
+        try:
+            fort_search_response = response['responses']['FORT_SEARCH']
+            result = int(fort_search_response['result'])
+            # Pokestop farmed
+            if result == 1:
+                try:
+                    experience = fort_search_response['experience_awarded']
+                    cooldown = fort_search_response['cooldown_complete_timestamp_ms']
+                except:
+                    experience = "(error)"
+                print "Pokestop farmed! +" + str(experience) + " XP - id: " + pokeid
+            # Already farmed
+            elif result == 3:
+                print "Pokestop already farmed, must wait - id: " + pokeid
+
+            # Unknow error
+            else:
+                print "Pokestop error: " + str(result) + " - id:" + pokeid
+        except:
+            print "Pokestop error: \r\n{}\r\n".format(json.dumps(response,indent=2))
+            break
+        time.sleep(5)
+    api.set_position(*old_position)
+
+position = ()
 
 def main():
+    global position
     global pokestops_farms
     running = True
     # log settings
@@ -197,7 +240,10 @@ def main():
         print " 5. Start pokestop farming"
         print " 0. Quit"
 
-        choice = input(" --> ")
+        try:
+            choice = input(" --> ")
+        except:
+            continue
         if (choice == 0): running = False
 
         # Move
@@ -238,41 +284,11 @@ def main():
 
         # Start pokestop farming
         elif (choice == 5):
-            if (len(pokestops_farms)) < 1:
-                print "No pokestops! Load or search for them."
-                continue
-            print "Starting to farm pokestops"
-            old_position = position
-            for pokeid, pokestop in pokestops_farms.iteritems():
-                lat = pokestop['latitude']
-                lng = pokestop['longitude']
-                dlat = position[0] - lat
-                dlng = position[1] - lng
-                api.set_position(*(lat, lng, 0.0))
-                api.fort_search(fort_id=pokeid, fort_latitude=lat, fort_longitude=lng, player_latitude=f2i(lat), player_longitude=f2i(lng))
-                response = api.call()
-                try:
-                    fort_search_response = response['responses']['FORT_SEARCH']
-                    result = int(fort_search_response['result'])
-                    # Pokestop farmed
-                    if result == 1:
-                        experience = fort_search_response['experience_awarded']
-                        cooldown = fort_search_response['cooldown_complete_timestamp_ms']
-                        print "Pokestop farmed! +" + str(experience) + " XP - id: " + pokeid
-                    # Already farmed
-                    elif result == 3:
-                        print "Pokestop already farmed, must wait - id: " + pokeid
+            #t = threading.Thread(target=pokefarm_thread, args=(api,))
+            #t.daemon = True
+            #t.start()
+            pokefarm_thread(api)
 
-                    # Unknow error
-                    else:
-                        print "Pokestop error: " + str(result) + " - id:" + pokeid
-                except:
-                    print "Pokestop error: \r\n{}\r\n".format(json.dumps(response,indent=2))
-                    break
-                time.sleep(5)
-            api.set_position(*old_position)
     
-    # execute the RPC call
-
 if __name__ == '__main__':
     main()
