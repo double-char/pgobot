@@ -1,3 +1,4 @@
+
 import os
 import re
 import json
@@ -16,54 +17,58 @@ from s2sphere import CellId, LatLng
 
 import threading
 
+from weakpokemons import *
+
 
 log = logging.getLogger(__name__)
 
 pokestops_filename = "pokestops.json"
-pokestops_farms = {}
+pokestops = []
+
+class nabbadict(dict):
+    def __hash__(self):
+        return hash(tuple(sorted(self.items())))
+    
 
 def pokefarm_load():
-    global pokestops_farms
+    global pokestops
     try:
         print "pokefarm_load == Loading pokestops from file.."
         f = open(pokestops_filename, 'r')
-        pokestops_farms = json.loads(f.read())
-        pokestops_farms
+        pokestops_dict = json.loads(f.read())
+        pokestops = pokestops_dict['pokestops']
         f.close()
     except:
         print "pokefarm_load == Can't load pokestops from file."
 
 def pokefarm_save():
-    pk_json = json.dumps(pokestops_farms)
+    global pokestops
+    print 'Saving pokestops'
+    pk_json = json.dumps({"pokestops": pokestops})
     f = open(pokestops_filename, 'wb')
     f.write(pk_json);
     f.close()
 
 def parse_getmapobjects_response(obj):
-    pokefarm_load()
+    global pokestops
+    # pokefarm_load()
+    # print obj
     status = obj['responses']['GET_MAP_OBJECTS']['status']
 
-    # yeah, it's orrible, if you want please fix this
     if status == 1:
         cells = obj['responses']['GET_MAP_OBJECTS']['map_cells']
         for i in cells:
-            if 'forts' in i:
-                for k in i['forts']:
-                    if not 'gym_points' in k:
-                        if k['id'] in pokestops_farms:
-                            print "Pokestop " + k['id'] + " already known"
-                            continue
-                        
-                        print "Pokestop at " + str(k['longitude']) + "," + str(k['latitude']),
-                        print " id: " + k['id']
-
-                        poke_id = k['id']
-                        
-                        del k['last_modified_timestamp_ms']
-                        del k['type']
-                        del k['enabled']
-                        del k['id']
-                        pokestops_farms[poke_id] = k
+            if not 'forts' in i:
+                continue
+            for k in i['forts']:
+                if 'gym_points' in k:
+                    continue
+                k = nabbadict(k)
+                if k in pokestops:
+                    continue
+                print "Pokestop at " + str(k['longitude']) + "," + str(k['latitude']),
+                print " id: " + k['id']
+                pokestops.append(k)
     pokefarm_save()
     
 
@@ -76,8 +81,10 @@ def get_pos_by_name(location_name):
         log.info('lat/long/alt: %s %s %s', loc.latitude, loc.longitude, loc.altitude)
         return (loc.latitude, loc.longitude, loc.altitude)
     except:
-        log.info("Can't get position, quitting")
+        log.error("Can't get position, quitting")
+        return (37.5, 15.0, 0.0)
         exit()
+        
         
 
 def get_cellid(lat, long):
@@ -137,19 +144,67 @@ def distance_by_points(lat1, lng1, lat2, lng2):
     coord2 = LatLng.from_degrees(lat2, lng2)
     angle = coord1.get_distance(coord2)
     return angle.radians
+def angle_to_meters(angle):
+    return angle * 6371e3
 
+def walk(api, position):
+    timestamp = "\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000"
+    cellid = get_cellid(position[0], position[1])
+    api.get_map_objects(latitude=f2i(position[0]), longitude=f2i(position[1]), since_timestamp_ms=timestamp, cell_id=cellid)
+    return api.call()
+
+def pokestop_sort(a, b):
+    a_dist = angle_to_meters(distance_by_points(position[0], position[1], a['latitude'], a['longitude']))
+    b_dist = angle_to_meters(distance_by_points(position[0], position[1], b['latitude'], b['longitude']))
+    return int(a_dist - b_dist)
 
 def pokefarm_thread(api):
     global position
-    if (len(pokestops_farms)) < 1:
+    if (len(pokestops)) < 1:
         print "No pokestops! Load or search for them."
         return
+    
+    pokestops.sort(pokestop_sort)
+    
     print "Starting to farm pokestops"
-    old_position = position
-    for pokeid, pokestop in pokestops_farms.iteritems():
+
+    first_stop = 0
+
+    for pokestop in pokestops:
+        if first_stop > 0:
+            now = time.time()
+            seconds = int(now-first_stop)
+            print "Time passed: " + str(now-first_stop)
+        pokestop['visited'] = True
+        pokeid = pokestop['id']
         lat = pokestop['latitude']
         lng = pokestop['longitude']
-        api.set_position(*(lat, lng, 0.0))
+        
+        o = distance_by_points(lat, lng, position[0], position[1])
+        v = 5
+        p = 3
+        w = v * p / 6371e3
+        nstep = int(o / w)
+        dlat = abs(lat-position[0])
+        dlng = abs(lng-position[1])
+        plat = o / dlat
+        plng = o / dlng
+        slat = w / plat
+        slng = w / plng
+        blat = position[0]
+        blng = position[1]
+        for i in range(1, nstep):
+            print "current step: " + str(i) + " / " + str(nstep)
+            nlat = blat + (i * slat)
+            nlng = blng + (i * slng)
+            print "Moved to " + str(nlat) + "," + str(nlng)
+            walk(api, (nlat, nlng, 0.0))
+            time.sleep(p)
+
+        # final step is pokestop
+        position = (lat, lng, 0.0)
+        api.set_position(*position)
+        
         api.fort_search(fort_id=pokeid, fort_latitude=lat, fort_longitude=lng, player_latitude=f2i(lat), player_longitude=f2i(lng))
         response = api.call()
         try:
@@ -159,75 +214,71 @@ def pokefarm_thread(api):
             if result == 1:
                 try:
                     experience = fort_search_response['experience_awarded']
-                    cooldown = fort_search_response['cooldown_complete_timestamp_ms']
                 except:
-                    experience = "(error)"
+                    experience = "(ERROR)"
+                #cooldown = fort_search_response['cooldown_complete_timestamp_ms']
+                if first_stop == 0:
+                    first_stop = time.time()
+                    print "First pokestop at: " + str(first_stop)
                 print "Pokestop farmed! +" + str(experience) + " XP - id: " + pokeid
+            # Too far
+            elif result == 2:
+                print "Pokestop too far! - id: " + pokeid
             # Already farmed
             elif result == 3:
                 print "Pokestop already farmed, must wait - id: " + pokeid
+            # Bag full
+            elif result == 4:
+                print "Your bag is full! - id: " + pokeid
 
             # Unknow error
             else:
                 print "Pokestop error: " + str(result) + " - id:" + pokeid
         except:
             print "Pokestop error: \r\n{}\r\n".format(json.dumps(response,indent=2))
-            break
-        time.sleep(5)
-    api.set_position(*old_position)
+            continue
+        time.sleep(2)
 
 position = ()
 
 def main():
     global position
-    global pokestops_farms
+    global pokestops
     running = True
-    # log settings
-    # log format
+    
     logging.basicConfig(level=logging.ERROR, format='%(asctime)s [%(module)10s] [%(levelname)5s] %(message)s')
-    # log level for http request class
     logging.getLogger("requests").setLevel(logging.WARNING)
-    # log level for main pgoapi class
-    logging.getLogger("pgoapi").setLevel(logging.INFO)
-    # log level for internal pgoapi class
-    logging.getLogger("rpc_api").setLevel(logging.INFO)
+    logging.getLogger("pgoapi").setLevel(logging.WARNING)
+    logging.getLogger("rpc_api").setLevel(logging.WARNING)
 
+    print "Checking configuration..."
     config = init_config()
     if not config:
         return
-        
+
     if config.debug:
         logging.getLogger("requests").setLevel(logging.DEBUG)
         logging.getLogger("pgoapi").setLevel(logging.DEBUG)
         logging.getLogger("rpc_api").setLevel(logging.DEBUG)
-    
+
+    print "Getting position..."
     position = get_pos_by_name(config.location)
-    if config.test:
-        return
-    
+
+    print "Loading pokedex..."
+    fpokedex = open('pokedex.json', 'rb')
+    pokedex = json.loads(fpokedex.read())
+    fpokedex.close()
+
     # instantiate pgoapi 
     api = PGoApi()
     
     # provide player position on the earth
     api.set_position(*position)
-    
+
+    print "Logging in..."
     if not api.login(config.auth_service, config.username, config.password):
         return
 
-    
-    # get player profile call
-    # ----------------------
-    #api.get_player()
-    
-    
-    # get map objects call
-    # ----------------------
-    #timestamp = "\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000"
-    #cellid = get_cellid(position[0], position[1])
-    #api.get_map_objects(latitude=f2i(position[0]), longitude=f2i(position[1]), since_timestamp_ms=timestamp, cell_id=cellid)
-
-    #response_dict = api.call()
-    #parse_getmapobjects_response(response_dict)
 
     while running:
         print "\r\n\r\n\r\n - What you want to do?"
@@ -238,6 +289,9 @@ def main():
         print " 3. Delete loaded pokestop"
         print " 4. Search & save pokestop"
         print " 5. Start pokestop farming"
+        print " 6. Get player info"
+        print " 7. Get inventory"
+        print " 8. Free weak pokemons"
         print " 0. Quit"
 
         try:
@@ -248,9 +302,9 @@ def main():
 
         # Move
         if (choice == 1):
-            lat = int(raw_input(" -- Input new latitude: (0 to cancel): "))
+            lat = float(raw_input(" -- Input new latitude: (0 to cancel): "))
             if (lat == 0): continue
-            lng = int(raw_input(" -- Input new longitude: (0 to cancel): "))
+            lng = float(raw_input(" -- Input new longitude: (0 to cancel): "))
             if (lng == 0): continue
             sure = raw_input(" -- Are you sure (y/n)? ")
             if (sure == "y"):
@@ -260,13 +314,13 @@ def main():
         # Show & Load pokestops
         elif (choice == 2):
             pokefarm_load()
-            for pokeid, value in pokestops_farms.iteritems():
-                print "Farm " + pokeid + " at " + str(value['latitude']) + "," + str(value['longitude'])
-            print "Loaded " + str(len(pokestops_farms)) + " farms!"
+            for pokestop in pokestops:
+                print pokestop['id'] + " at " + str(pokestop['latitude']) + "," + str(pokestop['longitude'])
+            print "Loaded " + str(len(pokestops)) + " farms!"
 
         # Delete pokestops
         elif (choice == 3):
-            pokestops_farms = {}
+            pokestops = []
             pokefarm_save()
             print "Deleted."
 
@@ -276,11 +330,8 @@ def main():
             cellid = get_cellid(position[0], position[1])
             api.get_map_objects(latitude=f2i(position[0]), longitude=f2i(position[1]), since_timestamp_ms=timestamp, cell_id=cellid)
             response_dict = api.call()
-            parse_getmapobjects_response(response_dict)
-            # print('Response dictionary: \n\r{}'.format(json.dumps(response_dict, indent=2)))
-
-            
-            print "Found " + str(len(pokestops_farms)) + " farms!"
+            parse_getmapobjects_response(response_dict)            
+            print "Found " + str(len(pokestops)) + " farms!"
 
         # Start pokestop farming
         elif (choice == 5):
@@ -288,6 +339,41 @@ def main():
             #t.daemon = True
             #t.start()
             pokefarm_thread(api)
+
+
+        # Player info
+        elif (choice == 6):
+            api.get_player()
+            response = api.call()
+            print response
+
+        # Inventory
+        elif (choice == 7):
+            api.get_inventory()
+            response = api.call()
+            file_inventory = open ("inventory.json", 'wb')
+            file_inventory.write(json.dumps(response))
+            file_inventory.close()
+            print "Written to inventory.json"
+
+        elif (choice == 8):
+            api.get_inventory()
+            inventory = api.call()
+            shouldfree = parse_inventory_for_weak_pokemon(inventory)
+            print "There are " + str(len(shouldfree)) + " pokemon to release"
+            released = 0
+            for i in shouldfree:
+                name = pokedex[str(i['pid'])]
+                print "(" + str(released) + "/" + str(len(shouldfree)) + ") Releasing " + name + " with CP: " + str(i['cp']) + " (" + str(i['id']) + ")",
+                api.release_pokemon(pokemon_id=i['id'])
+                response = api.call()
+                try:
+                    candies = response['responses']['RELEASE_POKEMON']['candy_awarded']
+                    print "got " + str(candies) + " candies"
+                except:
+                    print " - unknow error"
+                released += 1
+                time.sleep(1)
 
     
 if __name__ == '__main__':
