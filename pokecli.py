@@ -1,6 +1,7 @@
 
 import os
 import re
+import sys
 import json
 import struct
 import logging
@@ -8,17 +9,20 @@ import requests
 import argparse
 import time
 
-from pgoapi import PGoApi
-from pgoapi.utilities import f2i, h2f
+# add directory of this file to PATH, so that the package will be found
+sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 
+# import Pokemon Go API lib
+from pgoapi import pgoapi
+from pgoapi import utilities as util
+
+# other stuff
 from google.protobuf.internal import encoder
 from geopy.geocoders import GoogleV3
-from s2sphere import CellId, LatLng
-
-import threading
+from s2sphere import Cell, CellId, LatLng
 
 from weakpokemons import *
-
+from pokeutils import *
 
 log = logging.getLogger(__name__)
 
@@ -70,41 +74,7 @@ def parse_getmapobjects_response(obj):
                 print " id: " + k['id']
                 pokestops.append(k)
     pokefarm_save()
-    
 
-
-def get_pos_by_name(location_name):
-    geolocator = GoogleV3()
-    try:
-        loc = geolocator.geocode(location_name)        
-        log.info('Your given location: %s', loc.address.encode('utf-8'))
-        log.info('lat/long/alt: %s %s %s', loc.latitude, loc.longitude, loc.altitude)
-        return (loc.latitude, loc.longitude, loc.altitude)
-    except:
-        log.error("Can't get position, quitting")
-        return (37.5, 15.0, 0.0)
-        exit()
-        
-        
-
-def get_cellid(lat, long):
-    origin = CellId.from_lat_lng(LatLng.from_degrees(lat, long)).parent(15)
-    walk = [origin.id()]
-
-    # 10 before and 10 after
-    next = origin.next()
-    prev = origin.prev()
-    for i in range(10):
-        walk.append(prev.id())
-        walk.append(next.id())
-        next = next.next()
-        prev = prev.prev()
-    return ''.join(map(encode, sorted(walk)))
-
-def encode(cellid):
-    output = []
-    encoder._VarintEncoder()(output.append, cellid)
-    return ''.join(output)
     
 def init_config():
     parser = argparse.ArgumentParser()
@@ -121,7 +91,7 @@ def init_config():
     parser.add_argument("-a", "--auth_service", help="Auth Service ('ptc' or 'google')",
         required=required("auth_service"))
     parser.add_argument("-u", "--username", help="Username", required=required("username"))
-    parser.add_argument("-p", "--password", help="Password", required=required("password"))
+    parser.add_argument("-p", "--password", help="Password")
     parser.add_argument("-l", "--location", help="Location", required=required("location"))
     parser.add_argument("-d", "--debug", help="Debug Mode", action='store_true')
     parser.add_argument("-t", "--test", help="Only parse the specified location", action='store_true')
@@ -131,26 +101,27 @@ def init_config():
     # Passed in arguments shoud trump
     for key in config.__dict__:
         if key in load and config.__dict__[key] == None:
-            config.__dict__[key] = load[key]
+            config.__dict__[key] = str(load[key])
+
+    if config.__dict__["password"] is None:
+        log.info("Secure Password Input (if there is no password prompt, use --password <pw>):")
+        config.__dict__["password"] = getpass.getpass()
 
     if config.auth_service not in ['ptc', 'google']:
       log.error("Invalid Auth service specified! ('ptc' or 'google')")
       return None
-    
+
     return config
 
-def distance_by_points(lat1, lng1, lat2, lng2):
-    coord1 = LatLng.from_degrees(lat1, lng1)
-    coord2 = LatLng.from_degrees(lat2, lng2)
-    angle = coord1.get_distance(coord2)
-    return angle.radians
-def angle_to_meters(angle):
-    return angle * 6371e3
 
-def walk(api, position):
-    timestamp = "\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000"
-    cellid = get_cellid(position[0], position[1])
-    api.get_map_objects(latitude=f2i(position[0]), longitude=f2i(position[1]), since_timestamp_ms=timestamp, cell_id=cellid)
+def walk(api, new_position):
+    global position
+    cellid = get_cell_ids(new_position[0], new_position[1])
+    timestamp = [0,] * len(cellid)
+    position = new_position
+    api.set_position(*position)
+    api.get_map_objects(latitude=util.f2i(new_position[0]), longitude=util.f2i(new_position[1]), since_timestamp_ms=timestamp, cell_id=cellid)
+    #print "Position set to " + str(new_position[0]) + "," + str(new_position[1])
     return api.call()
 
 def pokestop_sort(a, b):
@@ -158,8 +129,37 @@ def pokestop_sort(a, b):
     b_dist = angle_to_meters(distance_by_points(position[0], position[1], b['latitude'], b['longitude']))
     return int(a_dist - b_dist)
 
+def pokefarm_move(api, lat, lng, v = 5):
+    print "Moving to: ", lat, ",", lng, " from ", position
+    o = distance_by_points(lat, lng, position[0], position[1])
+    p = 3
+    w = v * p / 6371e3
+    nstep = int(o / w)
+    dlat = position[0]-lat
+    dlng = position[1]-lng
+    if dlat != 0 and dlng != 0:
+        plat = o / dlat
+        plng = o / dlng
+        slat = w / plat
+        slng = w / plng
+        blat = position[0]
+        blng = position[1]
+        try:
+            for i in range(1, nstep + 1):
+                print "Did step " + str(i) + " / " + str(nstep)
+                nlat = blat - (i * slat)
+                nlng = blng - (i * slng)
+                walk(api, (nlat, nlng, 0.0))
+                time.sleep(p)
+        except KeyboardInterrupt:
+            return False
+    
+    return True
+
 def pokefarm_thread(api):
+    global total_xp
     global position
+    global should_restart_farming
     if (len(pokestops)) < 1:
         print "No pokestops! Load or search for them."
         return
@@ -170,42 +170,33 @@ def pokefarm_thread(api):
 
     first_stop = 0
 
+    starting_position = position
+    print "Starting position: ", starting_position
     for pokestop in pokestops:
         if first_stop > 0:
             now = time.time()
             seconds = int(now-first_stop)
-            print "Time passed: " + str(now-first_stop)
-        pokestop['visited'] = True
+            print "Time passed: " + str(seconds) + " seconds"
+            if (seconds > 300):
+                print "Stopping farm"
+                pokefarm_move(api, starting_position[0], starting_position[1], 10)
+                should_restart_farming = True
+                return
+        
         pokeid = pokestop['id']
         lat = pokestop['latitude']
         lng = pokestop['longitude']
         
-        o = distance_by_points(lat, lng, position[0], position[1])
-        v = 5
-        p = 3
-        w = v * p / 6371e3
-        nstep = int(o / w)
-        dlat = abs(lat-position[0])
-        dlng = abs(lng-position[1])
-        plat = o / dlat
-        plng = o / dlng
-        slat = w / plat
-        slng = w / plng
-        blat = position[0]
-        blng = position[1]
-        for i in range(1, nstep):
-            print "current step: " + str(i) + " / " + str(nstep)
-            nlat = blat + (i * slat)
-            nlng = blng + (i * slng)
-            print "Moved to " + str(nlat) + "," + str(nlng)
-            walk(api, (nlat, nlng, 0.0))
-            time.sleep(p)
+        if not pokefarm_move(api, lat, lng):
+            print "Farming cancelled, moving back"
+            should_restart_farming = False
+            if not pokefarm_move(api, starting_position[0], starting_position[1], 10):
+                print "Error: Can't move back."
+            return
 
-        # final step is pokestop
-        position = (lat, lng, 0.0)
-        api.set_position(*position)
+        print "Farming with position: ", position
         
-        api.fort_search(fort_id=pokeid, fort_latitude=lat, fort_longitude=lng, player_latitude=f2i(lat), player_longitude=f2i(lng))
+        api.fort_search(fort_id=pokeid, fort_latitude=lat, fort_longitude=lng, player_latitude=util.f2i(position[0]), player_longitude=util.f2i(position[1]))
         response = api.call()
         try:
             fort_search_response = response['responses']['FORT_SEARCH']
@@ -214,12 +205,10 @@ def pokefarm_thread(api):
             if result == 1:
                 try:
                     experience = fort_search_response['experience_awarded']
+                    total_xp += experience
                 except:
                     experience = "(ERROR)"
                 #cooldown = fort_search_response['cooldown_complete_timestamp_ms']
-                if first_stop == 0:
-                    first_stop = time.time()
-                    print "First pokestop at: " + str(first_stop)
                 print "Pokestop farmed! +" + str(experience) + " XP - id: " + pokeid
             # Too far
             elif result == 2:
@@ -229,21 +218,30 @@ def pokefarm_thread(api):
                 print "Pokestop already farmed, must wait - id: " + pokeid
             # Bag full
             elif result == 4:
-                print "Your bag is full! - id: " + pokeid
+                print "Your bag is full! (+50 XP)- id: " + pokeid
+                total_xp += 50
 
             # Unknow error
             else:
                 print "Pokestop error: " + str(result) + " - id:" + pokeid
+            if (first_stop == 0):
+                first_stop = time.time()
         except:
             print "Pokestop error: \r\n{}\r\n".format(json.dumps(response,indent=2))
             continue
-        time.sleep(2)
+
+        print "Total experience earned: " + str(total_xp)
+        time.sleep(1)
+    
 
 position = ()
+should_restart_farming = False
+total_xp = 0
 
 def main():
     global position
     global pokestops
+    global should_restart_farming
     running = True
     
     logging.basicConfig(level=logging.ERROR, format='%(asctime)s [%(module)10s] [%(levelname)5s] %(message)s')
@@ -270,12 +268,12 @@ def main():
     fpokedex.close()
 
     # instantiate pgoapi 
-    api = PGoApi()
+    api = pgoapi.PGoApi()
     
     # provide player position on the earth
     api.set_position(*position)
 
-    print "Logging in..."
+    print "Logging in with " + config.auth_service + ", " + config.username
     if not api.login(config.auth_service, config.username, config.password):
         return
 
@@ -294,11 +292,14 @@ def main():
         print " 8. Free weak pokemons"
         print " 0. Quit"
 
-        try:
-            choice = input(" --> ")
-        except:
-            continue
-        if (choice == 0): running = False
+        if should_restart_farming:
+            choice = 5
+        else:
+            try:
+                choice = input(" --> ")
+            except:
+                continue
+            if (choice == 0): running = False
 
         # Move
         if (choice == 1):
@@ -326,9 +327,9 @@ def main():
 
         # Search & save
         elif (choice == 4):
-            timestamp = "\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000"
-            cellid = get_cellid(position[0], position[1])
-            api.get_map_objects(latitude=f2i(position[0]), longitude=f2i(position[1]), since_timestamp_ms=timestamp, cell_id=cellid)
+            cellid = get_cell_ids(position[0], position[1])
+            timestamp = [0,] * len(cellid)
+            api.get_map_objects(latitude=util.f2i(position[0]), longitude=util.f2i(position[1]), since_timestamp_ms=timestamp, cell_id=cellid)
             response_dict = api.call()
             parse_getmapobjects_response(response_dict)            
             print "Found " + str(len(pokestops)) + " farms!"
