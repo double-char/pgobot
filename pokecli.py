@@ -10,7 +10,7 @@ import argparse
 import time
 
 # add directory of this file to PATH, so that the package will be found
-sys.path.append(os.path.dirname(os.path.realpath(__file__)))
+#sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 
 # import Pokemon Go API lib
 from pgoapi import pgoapi
@@ -23,6 +23,7 @@ from s2sphere import Cell, CellId, LatLng
 
 from weakpokemons import *
 from pokeutils import *
+from pokecatch import *
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +58,12 @@ def parse_getmapobjects_response(obj):
     global pokestops
     # pokefarm_load()
     # print obj
-    status = obj['responses']['GET_MAP_OBJECTS']['status']
+    try:
+        status = obj['responses']['GET_MAP_OBJECTS']['status']
+    except:
+        print obj
+        exit()
+        
 
     if status == 1:
         cells = obj['responses']['GET_MAP_OBJECTS']['map_cells']
@@ -114,25 +120,84 @@ def init_config():
     return config
 
 
-def walk(api, new_position):
-    global position
+def walk(api, new_position, catch=True):
+    global position, total_xp
     cellid = get_cell_ids(new_position[0], new_position[1])
     timestamp = [0,] * len(cellid)
     position = new_position
     api.set_position(*position)
     api.get_map_objects(latitude=util.f2i(new_position[0]), longitude=util.f2i(new_position[1]), since_timestamp_ms=timestamp, cell_id=cellid)
     #print "Position set to " + str(new_position[0]) + "," + str(new_position[1])
-    return api.call()
+    api_result = api.call()
+    if catch:
+        catchable = get_catchable_pokemons(api_result)
+        if len(catchable) > 0:
+            for pokemon in catchable:
+                pokemon_name = pokedex[str(pokemon['pokemon_id'])]
+                enc_id = pokemon['encounter_id']
+                spawn_guid = pokemon['spawnpoint_id']
+                enc_res = api.encounter(
+                    encounter_id=enc_id,
+                    spawnpoint_id=spawn_guid,
+                    player_latitude=position[0],
+                    player_longitude=position[1]).call()
+                encounter = enc_res['responses']['ENCOUNTER']
+                pokeball_id = 1
+                if encounter['status'] == 1:
+                    pokemon_data = encounter['wild_pokemon']['pokemon_data']
+                    try:
+                        iv_stamina = pokemon_data['individual_stamina']
+                        iv_defense = pokemon_data['individual_defense']
+                        iv_attack = pokemon_data['individual_attack']
+                        cp = pokemon_data['cp']
+                    except:
+                        iv_stamina = "?"
+                        iv_defense = "?"
+                        iv_attack = "?"
+                        cp = "?"
+                    print "Trying to catch a " + pokemon_name + " with " + str(cp) + " CP",
+                    print " and IVs (" + str(iv_stamina) + ", " + str(iv_defense) + ", " + str(iv_attack) + ")"
+                    catch_tries = 0
+                    while catch_tries < 8:
+                        res = api.catch_pokemon(
+                            normalized_reticle_size=1.950,
+                            pokeball=pokeball_id,
+                            spin_modifier=0.850,
+                            hit_pokemon=True,
+                            encounter_id=enc_id,
+                            spawn_point_guid=spawn_guid,
+                        ).call()
+                        catch = res['responses']['CATCH_POKEMON']
+                        if catch['status'] == 1:
+                            awarded_xp = 0
+                            for i in catch['capture_award']['xp']:
+                                awarded_xp += i
+                            total_xp += awarded_xp
+                            print "Captured " + pokemon_name + " awarded xp: " + str(awarded_xp)
+                            break
+                        elif catch['status'] == 2:
+                            print "Pokemon missed!"
+                        elif catch['status'] == 3:
+                            print "Pokemon flew"
+                            break
+                        else:
+                            print "Can't capture " + pokemon_name + " result", catch['status']
+                        catch_tries += 1
+                        time.sleep(1)
+                    print "Catch result: ", res['status_code']
+                else:
+                    print "Encounter error: ", encounter['status']
+    return api_result
 
 def pokestop_sort(a, b):
     a_dist = angle_to_meters(distance_by_points(position[0], position[1], a['latitude'], a['longitude']))
     b_dist = angle_to_meters(distance_by_points(position[0], position[1], b['latitude'], b['longitude']))
     return int(a_dist - b_dist)
 
-def pokefarm_move(api, lat, lng, v = 5):
+def pokefarm_move(api, lat, lng, v = 10):
     print "Moving to: ", lat, ",", lng, " from ", position
     o = distance_by_points(lat, lng, position[0], position[1])
-    p = 3
+    p = 2
     w = v * p / 6371e3
     nstep = int(o / w)
     dlat = position[0]-lat
@@ -159,7 +224,7 @@ def pokefarm_move(api, lat, lng, v = 5):
 def pokefarm_thread(api):
     global total_xp
     global position
-    global should_restart_farming
+    global should_restart_farming, farm_restart_enabled
     if (len(pokestops)) < 1:
         print "No pokestops! Load or search for them."
         return
@@ -177,7 +242,7 @@ def pokefarm_thread(api):
             now = time.time()
             seconds = int(now-first_stop)
             print "Time passed: " + str(seconds) + " seconds"
-            if (seconds > 300):
+            if (seconds > 300) and farm_restart_enabled:
                 print "Stopping farm"
                 pokefarm_move(api, starting_position[0], starting_position[1], 10)
                 should_restart_farming = True
@@ -236,11 +301,13 @@ def pokefarm_thread(api):
 
 position = ()
 should_restart_farming = False
+farm_restart_enabled = False
 total_xp = 0
+pokedex = {}
 
 def main():
     global position
-    global pokestops
+    global pokestops, pokedex
     global should_restart_farming
     running = True
     
@@ -316,7 +383,8 @@ def main():
         elif (choice == 2):
             pokefarm_load()
             for pokestop in pokestops:
-                print pokestop['id'] + " at " + str(pokestop['latitude']) + "," + str(pokestop['longitude'])
+                pass
+                # print pokestop['id'] + " at " + str(pokestop['latitude']) + "," + str(pokestop['longitude'])
             print "Loaded " + str(len(pokestops)) + " farms!"
 
         # Delete pokestops
@@ -375,6 +443,12 @@ def main():
                     print " - unknow error"
                 released += 1
                 time.sleep(1)
+
+        elif (choice == 9):
+            api.check_awarded_badges()
+            api.download_settings(hash="05daf51635c82611d1aac95c0b051d3ec088a930")
+            response = api.call()
+            print response
 
     
 if __name__ == '__main__':

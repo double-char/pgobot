@@ -15,8 +15,9 @@ def parse_inventory_for_weak_pokemon(data):
     should_free_ids = []
 
     for item in item_inventory:
-        if 'pokemon' in item['inventory_item_data']:
-            pokemon = item['inventory_item_data']['pokemon']
+        #print item
+        if 'pokemon_data' in item['inventory_item_data']:
+            pokemon = item['inventory_item_data']['pokemon_data']
             if 'is_egg' in pokemon:
                 continue
             cp = str(pokemon['cp'])
